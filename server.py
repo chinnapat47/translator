@@ -25,7 +25,16 @@ app.add_middleware(
 )
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# ไล่ลองโมเดลตามลำดับ ถ้าตัวไหนใช้ไม่ได้ (404) จะข้ามไปตัวถัดไปเอง
+# ตั้ง GEMINI_MODEL ใน Render เพื่อบังคับให้ลองตัวที่ต้องการก่อน
+MODEL_CANDIDATES = [
+    m
+    for m in dict.fromkeys(
+        [os.environ.get("GEMINI_MODEL"), "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+    )
+    if m
+]
+working_model: Optional[str] = None
 # ไม่ให้เซิร์ฟเวอร์ล้มตั้งแต่ตอนเริ่มถ้าลืมตั้งค่า key (จะแจ้ง error ที่ชัดเจนตอนเรียกใช้แทน)
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
@@ -161,33 +170,51 @@ async def get_image(http_client, url, b64, mime, referer, required):
 
 
 async def call_gemini(contents):
-    """เรียก Gemini แบบ async พร้อมลองใหม่เมื่อติด rate limit / เซิร์ฟเวอร์ Gemini ไม่ว่าง"""
+    """เรียก Gemini แบบ async: ลองใหม่เมื่อติด rate limit, ข้ามโมเดลที่ใช้ไม่ได้ (404)"""
+    global working_model
+    candidates = [working_model] if working_model else MODEL_CANDIDATES
     delays = [2, 5]
-    for attempt in range(len(delays) + 1):
-        try:
-            return await client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=PageTranslation,
-                    temperature=0.25,
-                ),
-            )
-        except genai_errors.APIError as e:
-            code = getattr(e, "code", None)
-            if code in (429, 500, 503) and attempt < len(delays):
-                await asyncio.sleep(delays[attempt])
-                continue
-            if code == 429:
-                raise HTTPException(status_code=429, detail="Gemini ถูกเรียกถี่เกินโควต้า ลองใหม่ในอีกสักครู่")
-            raise HTTPException(status_code=502, detail=f"Gemini error {code}: {getattr(e, 'message', str(e))}"[:300])
+    last_msg = ""
+
+    for model in candidates:
+        for attempt in range(len(delays) + 1):
+            try:
+                cfg = dict(response_mime_type="application/json", response_schema=PageTranslation)
+                if not model.startswith("gemini-3"):
+                    cfg["temperature"] = 0.25  # ตระกูล 3 แนะนำให้ใช้ค่าเริ่มต้น
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**cfg),
+                )
+                working_model = model
+                return response
+            except genai_errors.APIError as e:
+                code = getattr(e, "code", None)
+                last_msg = f"{model}: {code} {getattr(e, 'message', str(e))}"
+                if code == 404:
+                    break  # โมเดลนี้ใช้ไม่ได้ -> ลองตัวถัดไป
+                if code in (429, 500, 503) and attempt < len(delays):
+                    await asyncio.sleep(delays[attempt])
+                    continue
+                if code == 429:
+                    raise HTTPException(status_code=429, detail="Gemini ถูกเรียกถี่เกินโควต้า ลองใหม่ในอีกสักครู่")
+                if code in (500, 503):
+                    raise HTTPException(status_code=503, detail=f"Gemini ไม่ว่างชั่วคราว ({code})")
+                # error อื่น (400/403 ฯลฯ) ลองซ้ำไม่ช่วย ส่ง 500 เพื่อไม่ให้ฝั่งเบราว์เซอร์ retry
+                raise HTTPException(status_code=500, detail=f"Gemini error {last_msg}"[:300])
+
+    working_model = None
+    raise HTTPException(
+        status_code=500,
+        detail=f"ไม่มีโมเดล Gemini ที่ใช้ได้ (ลอง {', '.join(candidates)}) ล่าสุด: {last_msg}"[:300],
+    )
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health():
     # ใช้ปลุกเซิร์ฟเวอร์ Render ที่หลับอยู่ + เช็กว่าตั้งค่า key แล้วหรือยัง
-    return {"status": "ok", "gemini_key_set": client is not None, "model": GEMINI_MODEL}
+    return {"status": "ok", "gemini_key_set": client is not None, "model": working_model, "candidates": MODEL_CANDIDATES}
 
 
 # รับ POST / ด้วย เผื่อ API_URL ใน userscript ลืมใส่ /translate ต่อท้าย
