@@ -1,14 +1,19 @@
 import os
-import json
 import re
+import json
+import base64
+import asyncio
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
+
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 
 app = FastAPI()
 
@@ -19,23 +24,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# ไม่ให้เซิร์ฟเวอร์ล้มตั้งแต่ตอนเริ่มถ้าลืมตั้งค่า key (จะแจ้ง error ที่ชัดเจนตอนเรียกใช้แทน)
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # โฟลเดอร์เก็บความจำแยกตามเรื่อง
 MEMORY_DIR = Path("memory")
 MEMORY_DIR.mkdir(exist_ok=True)
+memory_lock = asyncio.Lock()
+
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+SUPPORTED_MIMES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
 
 
 # --- Schema ข้อมูลเข้า/ออก ---
 class TranslateRequest(BaseModel):
     series_id: str
-    image_url: str
-    prev_image_url: Optional[str] = None  # รูปก่อนหน้า (ช่วยดูหน้าตัวละครใน Manhwa)
+    image_url: str = ""
+    image_b64: Optional[str] = None         # รูปที่เบราว์เซอร์โหลดมาให้เอง (แก้ปัญหาเว็บบล็อกเซิร์ฟเวอร์)
+    image_mime: Optional[str] = None
+    prev_image_url: Optional[str] = None    # รูปก่อนหน้า (ช่วยดูหน้าตัวละครใน Manhwa)
+    prev_image_b64: Optional[str] = None
+    prev_image_mime: Optional[str] = None
     referer: str = ""
 
 
 class SpeechBubble(BaseModel):
-    box_2d: list[int]       # [ymin, xmin, ymax, xmax] สเกล 0-1000
+    box_2d: list[float]     # [ymin, xmin, ymax, xmax] สเกล 0-1000
     speaker_desc: str       # เช่น "ชายผมดำ", "หญิงชุดนักเรียน", "กล่องบรรยาย"
     pronoun_style: str      # เช่น "ฉัน/นาย", "ข้า/เจ้า", "ผม/คุณ"
     thai_text: str          # คำแปลภาษาไทย
@@ -54,10 +73,15 @@ def get_memory_path(series_id: str) -> Path:
 
 
 def load_memory(series_id: str) -> dict:
+    default = {"genre": "Unknown", "glossary": [], "recent_dialogues": []}
     path = get_memory_path(series_id)
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {"genre": "Unknown", "glossary": [], "recent_dialogues": []}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {**default, **data}
+        except Exception:
+            return default  # ไฟล์เสีย/อ่านไม่ได้ -> เริ่มใหม่ ไม่ให้ทั้งคำขอล้ม
+    return default
 
 
 def save_memory(series_id: str, data: dict):
@@ -65,29 +89,128 @@ def save_memory(series_id: str, data: dict):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# --- ฟังก์ชันจัดการรูป ---
+def sniff_mime(data: bytes, fallback: str = "image/jpeg") -> str:
+    """ดูชนิดไฟล์จากเนื้อไฟล์จริง (บาง CDN ส่ง content-type เป็น octet-stream)"""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[4:12] in (b"ftypavif", b"ftypavis"):
+        return "image/avif"
+    return fallback
+
+
 async def fetch_image(http_client: httpx.AsyncClient, url: str, referer: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-        "Referer": referer,
-    }
-    resp = await http_client.get(url, headers=headers)
-    if resp.status_code != 200:
-        return None, None
-    mime_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-    return resp.content, mime_type
+    origin = ""
+    if referer:
+        p = urlparse(referer)
+        if p.scheme and p.netloc:
+            origin = f"{p.scheme}://{p.netloc}/"
+    # ลอง Referer แบบเบราว์เซอร์จริง (origin) ก่อน แล้วค่อยลองลิงก์เต็ม
+    referers = [r for r in dict.fromkeys([origin, referer]) if r] or [""]
+
+    last_status = None
+    for ref in referers:
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if ref:
+            headers["Referer"] = ref
+        try:
+            resp = await http_client.get(url, headers=headers)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"โหลดรูปไม่สำเร็จ ({type(e).__name__})")
+        if resp.status_code == 200 and resp.content:
+            declared = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            return resp.content, sniff_mime(resp.content, declared)
+        last_status = resp.status_code
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"โหลดรูปจากเว็บต้นทางไม่สำเร็จ (HTTP {last_status}) เว็บอาจบล็อกเซิร์ฟเวอร์",
+    )
 
 
+async def get_image(http_client, url, b64, mime, referer, required):
+    """ใช้รูปที่เบราว์เซอร์ส่งมาก่อน ถ้าไม่มีค่อยให้เซิร์ฟเวอร์โหลดเอง"""
+    if b64:
+        try:
+            data = base64.b64decode(b64)
+        except Exception:
+            if required:
+                raise HTTPException(status_code=400, detail="ข้อมูลรูป (base64) ไม่ถูกต้อง")
+            return None
+        return data, sniff_mime(data, mime or "image/jpeg")
+    if url:
+        try:
+            return await fetch_image(http_client, url, referer)
+        except HTTPException:
+            if required:
+                raise
+            return None
+    if required:
+        raise HTTPException(status_code=400, detail="ไม่ได้ส่งรูปหลักมา")
+    return None
+
+
+async def call_gemini(contents):
+    """เรียก Gemini แบบ async พร้อมลองใหม่เมื่อติด rate limit / เซิร์ฟเวอร์ Gemini ไม่ว่าง"""
+    delays = [2, 5]
+    for attempt in range(len(delays) + 1):
+        try:
+            return await client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=PageTranslation,
+                    temperature=0.25,
+                ),
+            )
+        except genai_errors.APIError as e:
+            code = getattr(e, "code", None)
+            if code in (429, 500, 503) and attempt < len(delays):
+                await asyncio.sleep(delays[attempt])
+                continue
+            if code == 429:
+                raise HTTPException(status_code=429, detail="Gemini ถูกเรียกถี่เกินโควต้า ลองใหม่ในอีกสักครู่")
+            raise HTTPException(status_code=502, detail=f"Gemini error {code}: {getattr(e, 'message', str(e))}"[:300])
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
+async def health():
+    # ใช้ปลุกเซิร์ฟเวอร์ Render ที่หลับอยู่ + เช็กว่าตั้งค่า key แล้วหรือยัง
+    return {"status": "ok", "gemini_key_set": client is not None, "model": GEMINI_MODEL}
+
+
+# รับ POST / ด้วย เผื่อ API_URL ใน userscript ลืมใส่ /translate ต่อท้าย
+@app.post("/", response_model=PageTranslation, include_in_schema=False)
 @app.post("/translate", response_model=PageTranslation)
 async def translate_manhwa_page(req: TranslateRequest):
+    if client is None:
+        raise HTTPException(status_code=500, detail="เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า GEMINI_API_KEY ใน Render")
+
     # 1. โหลดรูปปัจจุบัน (และรูปก่อนหน้าถ้ามี)
     async with httpx.AsyncClient(follow_redirects=True, timeout=25.0) as http_client:
-        img_bytes, mime_type = await fetch_image(http_client, req.image_url, req.referer)
-        if not img_bytes:
-            raise HTTPException(status_code=400, detail="โหลดรูปหลักไม่สำเร็จ")
+        main = await get_image(http_client, req.image_url, req.image_b64, req.image_mime, req.referer, True)
+        prev = await get_image(
+            http_client, req.prev_image_url, req.prev_image_b64, req.prev_image_mime, req.referer, False
+        )
 
-        prev_bytes, prev_mime = (None, None)
-        if req.prev_image_url:
-            prev_bytes, prev_mime = await fetch_image(http_client, req.prev_image_url, req.referer)
+    img_bytes, mime_type = main
+    if mime_type not in SUPPORTED_MIMES:
+        raise HTTPException(status_code=415, detail=f"Gemini ไม่รองรับไฟล์รูปชนิด {mime_type}")
+
+    prev_bytes, prev_mime = prev if prev else (None, None)
+    if prev_mime and prev_mime not in SUPPORTED_MIMES:
+        prev_bytes = None
 
     # 2. โหลดความจำของเรื่องนี้
     mem = load_memory(req.series_id)
@@ -123,32 +246,34 @@ async def translate_manhwa_page(req: TranslateRequest):
     contents.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
     contents.append(prompt)
 
+    response = await call_gemini(contents)
+
+    text = response.text
+    if not text:
+        raise HTTPException(status_code=502, detail="Gemini ไม่ส่งคำตอบกลับมา (อาจถูกบล็อกโดยตัวกรองเนื้อหา)")
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=PageTranslation,
-                temperature=0.25,
-            ),
-        )
-        result = PageTranslation.model_validate_json(response.text)
+        result = PageTranslation.model_validate_json(text)
+    except ValidationError:
+        raise HTTPException(status_code=502, detail="Gemini ตอบกลับในรูปแบบที่อ่านไม่ได้ ลองใหม่อีกครั้ง")
 
-        # 4. อัปเดตความจำของเรื่องนี้ลงไฟล์ JSON
-        if result.detected_genre and mem["genre"] == "Unknown":
-            mem["genre"] = result.detected_genre
+    # 4. อัปเดตความจำของเรื่องนี้ลงไฟล์ JSON (ล็อกกันหลายคำขอเขียนทับกัน)
+    try:
+        async with memory_lock:
+            mem = load_memory(req.series_id)
+            if result.detected_genre and mem["genre"] == "Unknown":
+                mem["genre"] = result.detected_genre
 
-        for entry in result.new_glossary:
-            if entry not in mem["glossary"]:
-                mem["glossary"].append(entry)
+            for entry in result.new_glossary:
+                if entry not in mem["glossary"]:
+                    mem["glossary"].append(entry)
 
-        for b in result.bubbles:
-            mem["recent_dialogues"].append(f"[{b.speaker_desc}]: {b.thai_text}")
-        mem["recent_dialogues"] = mem["recent_dialogues"][-20:]  # เก็บแค่ 20 บรรทัดล่าสุด
+            for b in result.bubbles:
+                mem["recent_dialogues"].append(f"[{b.speaker_desc}]: {b.thai_text}")
+            mem["recent_dialogues"] = mem["recent_dialogues"][-20:]  # เก็บแค่ 20 บรรทัดล่าสุด
 
-        save_memory(req.series_id, mem)
-        return result
-
+            save_memory(req.series_id, mem)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # เซฟความจำพลาดไม่ควรทำให้คำแปลที่ได้มาแล้วหายไป
+        print(f"memory save failed: {e}")
+
+    return result
