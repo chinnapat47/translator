@@ -170,11 +170,19 @@ async def get_image(http_client, url, b64, mime, referer, required):
 
 
 async def call_gemini(contents):
-    """เรียก Gemini แบบ async: ลองใหม่เมื่อติด rate limit, ข้ามโมเดลที่ใช้ไม่ได้ (404)"""
+    """เรียก Gemini แบบ async
+    - 404 (โมเดลใช้ไม่ได้) หรือ 429 (โควต้าเต็ม; โควต้านับแยกตามโมเดล) -> ข้ามไปโมเดลถัดไปทันที
+    - 500/503 (Gemini ไม่ว่าง) -> ลองซ้ำสั้นๆ แล้วค่อยข้ามไปโมเดลถัดไป
+    """
     global working_model
-    candidates = [working_model] if working_model else MODEL_CANDIDATES
+    candidates = ([working_model] if working_model else []) + [
+        m for m in MODEL_CANDIDATES if m != working_model
+    ]
     delays = [2, 5]
     last_msg = ""
+    quota_hit = False
+    quota_all_daily = True
+    overloaded = False
 
     for model in candidates:
         for attempt in range(len(delays) + 1):
@@ -191,20 +199,31 @@ async def call_gemini(contents):
                 return response
             except genai_errors.APIError as e:
                 code = getattr(e, "code", None)
-                last_msg = f"{model}: {code} {getattr(e, 'message', str(e))}"
+                raw = str(e)
+                last_msg = f"{model}: {code} {getattr(e, 'message', raw)}"
                 if code == 404:
-                    break  # โมเดลนี้ใช้ไม่ได้ -> ลองตัวถัดไป
-                if code in (429, 500, 503) and attempt < len(delays):
-                    await asyncio.sleep(delays[attempt])
-                    continue
+                    if model == working_model:
+                        working_model = None
+                    break
                 if code == 429:
-                    raise HTTPException(status_code=429, detail="Gemini ถูกเรียกถี่เกินโควต้า ลองใหม่ในอีกสักครู่")
+                    quota_hit = True
+                    if "perday" not in raw.lower().replace(" ", "").replace("_", ""):
+                        quota_all_daily = False
+                    break
                 if code in (500, 503):
-                    raise HTTPException(status_code=503, detail=f"Gemini ไม่ว่างชั่วคราว ({code})")
+                    overloaded = True
+                    if attempt < len(delays):
+                        await asyncio.sleep(delays[attempt])
+                        continue
+                    break
                 # error อื่น (400/403 ฯลฯ) ลองซ้ำไม่ช่วย ส่ง 500 เพื่อไม่ให้ฝั่งเบราว์เซอร์ retry
                 raise HTTPException(status_code=500, detail=f"Gemini error {last_msg}"[:300])
 
-    working_model = None
+    if quota_hit:
+        kind = "รายวัน" if quota_all_daily else "ต่อนาที"
+        raise HTTPException(status_code=429, detail=f"Gemini โควต้าเต็ม ({kind}) {last_msg}"[:300])
+    if overloaded:
+        raise HTTPException(status_code=503, detail=f"Gemini ไม่ว่างชั่วคราว {last_msg}"[:300])
     raise HTTPException(
         status_code=500,
         detail=f"ไม่มีโมเดล Gemini ที่ใช้ได้ (ลอง {', '.join(candidates)}) ล่าสุด: {last_msg}"[:300],

@@ -17,7 +17,8 @@
   const API_BASE = 'https://translator-o53c.onrender.com';
   const API_URL = API_BASE + '/translate';
 
-  const MAX_CONCURRENT = 2;          // แปลพร้อมกันได้กี่รูป (กัน Gemini rate limit)
+  const MAX_CONCURRENT = 2;          // แปลพร้อมกันได้กี่รูป
+  const MIN_INTERVAL_MS = 6500;      // เว้นระยะระหว่างคำขอ (~9 ครั้ง/นาที) กัน Gemini ตอบ 429 ปรับเลขนี้ได้ตามโควต้าของคุณ
   const MAX_UPLOAD_WIDTH = 1000;     // ย่อรูปก่อนส่ง ให้ส่งเร็วและไม่เกินขนาดที่เซิร์ฟเวอร์รับ
   const MAX_CANVAS_PIXELS = 16000000; // ขีดจำกัด canvas ของ iOS Safari
   const REQUEST_TIMEOUT = 120000;    // Render ฟรีตื่นจากหลับได้นานถึง ~1 นาที
@@ -211,15 +212,30 @@
     return JSON.parse(text);
   }
 
-  // ลองใหม่เมื่อเซิร์ฟเวอร์เพิ่งตื่น (502/503/504), โดน rate limit (429) หรือเน็ตสะดุด
-  async function callApiWithRetry(payload) {
-    const delays = [3000, 8000];
+  // เว้นจังหวะคำขอทั้งหมด (รวมที่ retry) ให้ไม่ถี่เกินโควต้าต่อนาที
+  let nextSlot = 0;
+  async function rateGate() {
+    const now = Date.now();
+    const wait = Math.max(0, nextSlot - now);
+    nextSlot = Math.max(now, nextSlot) + MIN_INTERVAL_MS;
+    if (wait) await sleep(wait);
+  }
+
+  // ลองใหม่เมื่อเซิร์ฟเวอร์เพิ่งตื่น/ไม่ว่าง (502/503/504), เน็ตสะดุด หรือโควต้าต่อนาทีเต็ม (429)
+  // โควต้ารายวันหมดจะไม่ลองซ้ำ เพราะรอไปก็ไม่หาย
+  async function callApiWithRetry(payload, onWait) {
     for (let i = 0; ; i++) {
+      await rateGate();
       try {
         return await callApi(payload);
       } catch (e) {
-        const retriable = e.status === undefined || [429, 502, 503, 504].includes(e.status);
+        const quota = e.status === 429;
+        const daily = quota && /รายวัน/.test(e.message);
+        const retriable =
+          !daily && (e.status === undefined || quota || [502, 503, 504].includes(e.status));
+        const delays = quota ? [20000, 40000] : [3000, 8000];
         if (!retriable || i >= delays.length) throw e;
+        if (onWait) onWait(quota ? 'โควต้าเต็มชั่วคราว รอลองใหม่...' : 'เซิร์ฟเวอร์ไม่ว่าง รอลองใหม่...');
         await sleep(delays[i]);
       }
     }
@@ -391,7 +407,11 @@
       badge.onclick = null;
       try {
         const payload = await buildPayload(src, prevSrc);
-        const data = await enqueue(() => callApiWithRetry(payload));
+        const data = await enqueue(() =>
+          callApiWithRetry(payload, (m) => {
+            badge.innerText = m;
+          })
+        );
         renderBubbles(wrapper, data);
         badge.remove();
       } catch (err) {
