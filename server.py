@@ -3,6 +3,8 @@ import re
 import json
 import base64
 import asyncio
+import hashlib
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -30,7 +32,13 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL_CANDIDATES = [
     m
     for m in dict.fromkeys(
-        [os.environ.get("GEMINI_MODEL"), "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+        [
+            os.environ.get("GEMINI_MODEL"),
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",  # เร็วและโควต้าแยก ใช้เป็นตัวสำรองสุดท้าย
+        ]
     )
     if m
 ]
@@ -42,6 +50,10 @@ client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 MEMORY_DIR = Path("memory")
 MEMORY_DIR.mkdir(exist_ok=True)
 memory_lock = asyncio.Lock()
+
+# แคชผลแปลตามเนื้อรูป (อ่านซ้ำหรือรีเฟรชแล้วไม่ต้องเรียก Gemini อีก ประหยัดโควต้า)
+RESULT_CACHE: "OrderedDict[str, str]" = OrderedDict()
+RESULT_CACHE_MAX = 300
 
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -178,18 +190,24 @@ async def call_gemini(contents):
     candidates = ([working_model] if working_model else []) + [
         m for m in MODEL_CANDIDATES if m != working_model
     ]
-    delays = [2, 5]
+    delays = [1.5]  # Gemini ไม่ว่าง: ลองซ้ำครั้งเดียวแล้วข้ามไปรุ่นถัดไป ไม่รอนาน
     last_msg = ""
     quota_hit = False
     quota_all_daily = True
     overloaded = False
 
     for model in candidates:
+        use_thinking = True
         for attempt in range(len(delays) + 1):
             try:
                 cfg = dict(response_mime_type="application/json", response_schema=PageTranslation)
-                if not model.startswith("gemini-3"):
-                    cfg["temperature"] = 0.25  # ตระกูล 3 แนะนำให้ใช้ค่าเริ่มต้น
+                if model.startswith("gemini-3"):
+                    # ค่าเริ่มต้นของตระกูล 3 คือคิดระดับ medium ซึ่งช้า งานอ่านแล้วแปลใช้ low พอ
+                    # (LOW รองรับทุกรุ่น; MINIMAL ใช้กับ 3.7/3.8 ไม่ได้)
+                    if use_thinking:
+                        cfg["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+                else:
+                    cfg["temperature"] = 0.25
                 response = await client.aio.models.generate_content(
                     model=model,
                     contents=contents,
@@ -201,6 +219,9 @@ async def call_gemini(contents):
                 code = getattr(e, "code", None)
                 raw = str(e)
                 last_msg = f"{model}: {code} {getattr(e, 'message', raw)}"
+                if code == 400 and use_thinking and "thinking" in raw.lower():
+                    use_thinking = False  # รุ่นนี้ไม่รับ thinking_level -> ลองใหม่แบบไม่ตั้ง
+                    continue
                 if code == 404:
                     if model == working_model:
                         working_model = None
@@ -258,6 +279,12 @@ async def translate_manhwa_page(req: TranslateRequest):
     if prev_mime and prev_mime not in SUPPORTED_MIMES:
         prev_bytes = None
 
+    cache_key = hashlib.sha1(img_bytes).hexdigest()
+    cached = RESULT_CACHE.get(cache_key)
+    if cached:
+        RESULT_CACHE.move_to_end(cache_key)
+        return PageTranslation.model_validate_json(cached)
+
     # 2. โหลดความจำของเรื่องนี้
     mem = load_memory(req.series_id)
     glossary_text = "\n".join(f"- {item}" for item in mem["glossary"][-40:]) or "ยังไม่มีข้อมูล"
@@ -282,6 +309,8 @@ async def translate_manhwa_page(req: TranslateRequest):
 4. ข้ามเสียงเอฟเฟกต์ (SFX) ขนาดใหญ่ที่เป็นส่วนหนึ่งของฉาก
 5. หากเจอชื่อตัวละครใหม่หรือศัพท์เฉพาะสำคัญที่ยังไม่มีในลิสต์ ให้เพิ่มใน `new_glossary` ในรูปแบบ "ชื่อ (เพศ, บทบาท/สรรพนาม)"
 6. ระบุพิกัดกรอบคำพูดใน `box_2d` แบบ [ymin, xmin, ymax, xmax] (สเกล 0-1000)
+7. ให้ `box_2d` ครอบข้อความต้นฉบับทั้งหมดในกรอบคำพูดนั้นให้มิดทุกตัวอักษร แต่อย่าลามไปทับภาพวาดนอกกรอบ เพราะคำแปลจะถูกวางทับตรงกรอบนี้
+8. คำแปลต้องกระชับพอใส่ลงในกรอบเดิมได้ ตัดคำฟุ่มเฟือย และไม่ต้องขึ้นบรรทัดใหม่เอง
 """
 
     contents = []
@@ -301,6 +330,10 @@ async def translate_manhwa_page(req: TranslateRequest):
         result = PageTranslation.model_validate_json(text)
     except ValidationError:
         raise HTTPException(status_code=502, detail="Gemini ตอบกลับในรูปแบบที่อ่านไม่ได้ ลองใหม่อีกครั้ง")
+
+    RESULT_CACHE[cache_key] = result.model_dump_json()
+    while len(RESULT_CACHE) > RESULT_CACHE_MAX:
+        RESULT_CACHE.popitem(last=False)
 
     # 4. อัปเดตความจำของเรื่องนี้ลงไฟล์ JSON (ล็อกกันหลายคำขอเขียนทับกัน)
     try:

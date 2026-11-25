@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         iOS Manhwa Context-Aware Translator
 // @namespace    http://tampermonkey.net/
-// @version      2.2
-// @description  แปล Manhwa อังกฤษ/ญี่ปุ่นเป็นไทย พร้อมจำบริบทแยกตามเรื่อง
+// @version      2.3
+// @description  แปล Manhwa อังกฤษ/ญี่ปุ่นเป็นไทย พร้อมจำบริบทแยกตามเรื่อง วางคำแปลกลืนกับภาพ
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
@@ -17,11 +17,15 @@
   const API_BASE = 'https://translator-o53c.onrender.com';
   const API_URL = API_BASE + '/translate';
 
-  const MAX_CONCURRENT = 2;          // แปลพร้อมกันได้กี่รูป
-  const MIN_INTERVAL_MS = 6500;      // เว้นระยะระหว่างคำขอ (~9 ครั้ง/นาที) กัน Gemini ตอบ 429 ปรับเลขนี้ได้ตามโควต้าของคุณ
+  const MAX_CONCURRENT = 3;          // แปลพร้อมกันได้กี่รูป
+  const FAST_INTERVAL_MS = 1200;     // เว้นระยะระหว่างคำขอตามปกติ
+  const SLOW_INTERVAL_MS = 6500;     // ถ้าเจอ 429 (โควต้าต่อนาทีเต็ม) จะเปลี่ยนมาใช้ค่านี้ไปจนปิดหน้า
+  const USE_PREV_IMAGE = false;      // true = ส่งรูปก่อนหน้าไปช่วยดูบริบทตัวละคร (แม่นขึ้นเล็กน้อย แต่ช้าลงเกือบเท่าตัว)
+  const LOOKAHEAD_PX = 2500;         // เริ่มแปลรูปที่อยู่ถัดลงไปล่วงหน้ากี่พิกเซล (ยิ่งมากยิ่งไม่ต้องรอ แต่ใช้โควต้าไวขึ้น)
   const MAX_UPLOAD_WIDTH = 1000;     // ย่อรูปก่อนส่ง ให้ส่งเร็วและไม่เกินขนาดที่เซิร์ฟเวอร์รับ
   const MAX_CANVAS_PIXELS = 16000000; // ขีดจำกัด canvas ของ iOS Safari
   const REQUEST_TIMEOUT = 120000;    // Render ฟรีตื่นจากหลับได้นานถึง ~1 นาที
+  const CACHE_PREFIX = 'mtc1:';      // แคชคำแปลในเครื่อง (อ่านซ้ำแล้วขึ้นทันที ไม่เสียโควต้า)
 
   let isEnabled = false;
   const processedImages = new WeakSet();
@@ -62,6 +66,50 @@
     return cleanPath || document.title.slice(0, 30).replace(/[^a-zA-Z0-9]+/g, '_');
   }
 
+  // ---------- แคชคำแปลในเครื่อง ----------
+
+  function cacheGet(src) {
+    try {
+      const raw = localStorage.getItem(CACHE_PREFIX + src);
+      return raw ? JSON.parse(raw).d : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function trimCache() {
+    const items = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(CACHE_PREFIX)) {
+        let t = 0;
+        try {
+          t = JSON.parse(localStorage.getItem(k)).t || 0;
+        } catch (e) {
+          /* ข้าม */
+        }
+        items.push([k, t]);
+      }
+    }
+    items.sort((a, b) => a[1] - b[1]);
+    items.slice(0, Math.ceil(items.length / 2)).forEach(([k]) => localStorage.removeItem(k));
+  }
+
+  function cacheSet(src, data) {
+    const key = CACHE_PREFIX + src;
+    const val = JSON.stringify({ t: Date.now(), d: data });
+    try {
+      localStorage.setItem(key, val);
+    } catch (e) {
+      try {
+        trimCache();
+        localStorage.setItem(key, val);
+      } catch (e2) {
+        /* แคชเต็ม/ใช้ไม่ได้ ข้ามไป */
+      }
+    }
+  }
+
   // ---------- โหลดรูปผ่านเบราว์เซอร์ แล้วส่งให้เซิร์ฟเวอร์ ----------
   // (เซิร์ฟเวอร์ Render โหลดรูปเองมักโดน CDN ของเว็บมังงะบล็อก ได้ HTTP 403)
 
@@ -91,10 +139,21 @@
     return btoa(binary);
   }
 
+  // canvas ขนาดเล็กไว้เก็บสีพื้นของกรอบคำพูด (กว้างไม่เกิน 400px ประหยัดหน่วยความจำมือถือ)
+  function makeSampleCanvas(srcCanvas) {
+    const sw = Math.min(400, srcCanvas.width);
+    const sh = Math.max(1, Math.round((srcCanvas.height * sw) / srcCanvas.width));
+    const c = document.createElement('canvas');
+    c.width = sw;
+    c.height = sh;
+    c.getContext('2d').drawImage(srcCanvas, 0, 0, sw, sh);
+    return c;
+  }
+
   // ย่อรูป + แปลงเป็น JPEG (ได้ทั้ง avif/webp ที่ Gemini ไม่รับ) ถ้าทำไม่ได้ก็ส่งไฟล์เดิม
   function prepareImage(buf) {
     return new Promise((resolve) => {
-      const sendRaw = () => resolve({ b64: bufferToBase64(buf), mime: '' });
+      const sendRaw = () => resolve({ b64: bufferToBase64(buf), mime: '', sample: null });
       let objUrl;
       try {
         objUrl = URL.createObjectURL(new Blob([buf]));
@@ -113,8 +172,14 @@
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             ctx.drawImage(im, 0, 0, canvas.width, canvas.height);
             const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            let sample = null;
+            try {
+              sample = makeSampleCanvas(canvas);
+            } catch (e) {
+              /* ไม่มีสีพื้นก็ใช้สีขาวแทน */
+            }
             URL.revokeObjectURL(objUrl);
-            resolve({ b64: dataUrl.split(',')[1], mime: 'image/jpeg' });
+            resolve({ b64: dataUrl.split(',')[1], mime: 'image/jpeg', sample });
           } catch (e) {
             URL.revokeObjectURL(objUrl);
             sendRaw();
@@ -132,14 +197,14 @@
     });
   }
 
-  // แคชรูปที่เตรียมแล้ว (รูปหนึ่งถูกใช้เป็น "รูปก่อนหน้า" ของรูปถัดไปด้วย)
+  // แคชรูปที่เตรียมแล้ว (กรณีเปิด USE_PREV_IMAGE รูปหนึ่งถูกใช้เป็น "รูปก่อนหน้า" ของรูปถัดไปด้วย)
   const prepCache = new Map();
   function getPrepared(src) {
     if (!prepCache.has(src)) {
       const p = downloadImage(src).then(prepareImage);
       p.catch(() => prepCache.delete(src));
       prepCache.set(src, p);
-      if (prepCache.size > 8) prepCache.delete(prepCache.keys().next().value);
+      if (prepCache.size > 6) prepCache.delete(prepCache.keys().next().value);
     }
     return prepCache.get(src);
   }
@@ -148,19 +213,21 @@
     const payload = {
       series_id: getSeriesId(),
       image_url: src,
-      prev_image_url: prevSrc,
+      prev_image_url: USE_PREV_IMAGE ? prevSrc : null,
       referer: window.location.href,
     };
-    if (!gmXhr) return payload; // ไม่มี GM -> ให้เซิร์ฟเวอร์โหลดเอง
+    let sample = null;
+    if (!gmXhr) return { payload, sample }; // ไม่มี GM -> ให้เซิร์ฟเวอร์โหลดเอง
     try {
       const main = await getPrepared(src);
       payload.image_b64 = main.b64;
       payload.image_mime = main.mime;
+      sample = main.sample || null;
     } catch (e) {
       console.warn('Translator: โหลดรูปผ่านเบราว์เซอร์ไม่ได้ ให้เซิร์ฟเวอร์ลองโหลดเอง', e);
-      return payload;
+      return { payload, sample };
     }
-    if (prevSrc) {
+    if (USE_PREV_IMAGE && prevSrc) {
       try {
         const prev = await getPrepared(prevSrc);
         payload.prev_image_b64 = prev.b64;
@@ -169,7 +236,7 @@
         /* รูปก่อนหน้าเป็นแค่ตัวช่วย ข้ามได้ */
       }
     }
-    return payload;
+    return { payload, sample };
   }
 
   // ---------- เรียก API ----------
@@ -214,10 +281,11 @@
 
   // เว้นจังหวะคำขอทั้งหมด (รวมที่ retry) ให้ไม่ถี่เกินโควต้าต่อนาที
   let nextSlot = 0;
+  let intervalMs = FAST_INTERVAL_MS;
   async function rateGate() {
     const now = Date.now();
     const wait = Math.max(0, nextSlot - now);
-    nextSlot = Math.max(now, nextSlot) + MIN_INTERVAL_MS;
+    nextSlot = Math.max(now, nextSlot) + intervalMs;
     if (wait) await sleep(wait);
   }
 
@@ -230,6 +298,7 @@
         return await callApi(payload);
       } catch (e) {
         const quota = e.status === 429;
+        if (quota) intervalMs = SLOW_INTERVAL_MS; // เจอโควต้าเต็มแล้ว ชะลอจังหวะที่เหลือ
         const daily = quota && /รายวัน/.test(e.message);
         const retriable =
           !daily && (e.status === undefined || quota || [502, 503, 504].includes(e.status));
@@ -241,12 +310,28 @@
     }
   }
 
-  // คิว: จำกัดจำนวนที่แปลพร้อมกัน
+  // คิว: จำกัดจำนวนที่แปลพร้อมกัน และเลือกรูปที่ใกล้จุดที่กำลังอ่านอยู่ก่อน
   let running = 0;
   const queue = [];
+
+  function priorityOf(img) {
+    const r = img.getBoundingClientRect();
+    if (r.bottom < 0) return 1e6 + Math.abs(r.bottom); // เลื่อนผ่านไปแล้ว ไว้ทำทีหลังสุด
+    return Math.max(0, r.top); // รูปที่เห็นอยู่ก่อน แล้วค่อยรูปที่ใกล้ที่สุดถัดลงไป
+  }
+
   function pump() {
     while (running < MAX_CONCURRENT && queue.length) {
-      const job = queue.shift();
+      let bestIdx = 0;
+      let bestP = Infinity;
+      queue.forEach((job, i) => {
+        const p = priorityOf(job.img);
+        if (p < bestP) {
+          bestP = p;
+          bestIdx = i;
+        }
+      });
+      const job = queue.splice(bestIdx, 1)[0];
       running++;
       job.task().then(job.resolve, job.reject).finally(() => {
         running--;
@@ -254,9 +339,10 @@
       });
     }
   }
-  function enqueue(task) {
+
+  function enqueue(task, img) {
     return new Promise((resolve, reject) => {
-      queue.push({ task, resolve, reject });
+      queue.push({ task, img, resolve, reject });
       pump();
     });
   }
@@ -267,6 +353,58 @@
       gmRequest({ method: 'GET', url: API_BASE + '/', timeout: 90000 }).catch(() => {});
     } else {
       fetch(API_BASE + '/', { mode: 'no-cors' }).catch(() => {});
+    }
+  }
+
+  // ---------- สีพื้นกรอบคำพูด (ให้คำแปลกลืนกับภาพ) ----------
+
+  // หาสีที่พบมากที่สุดในกรอบ (ตัวอักษรเดิมเป็นส่วนน้อย จึงได้สีพื้นของกรอบ)
+  function sampleBox(canvas, box) {
+    try {
+      const cw = canvas.width;
+      const ch = canvas.height;
+      const ys = [Number(box[0]), Number(box[2])].sort((a, b) => a - b);
+      const xs = [Number(box[1]), Number(box[3])].sort((a, b) => a - b);
+      const x0 = Math.max(0, Math.floor((xs[0] / 1000) * cw));
+      const x1 = Math.min(cw, Math.ceil((xs[1] / 1000) * cw));
+      const y0 = Math.max(0, Math.floor((ys[0] / 1000) * ch));
+      const y1 = Math.min(ch, Math.ceil((ys[1] / 1000) * ch));
+      const w = x1 - x0;
+      const h = y1 - y0;
+      if (!(w >= 2 && h >= 2)) return null;
+      const data = canvas.getContext('2d').getImageData(x0, y0, w, h).data;
+      const step = Math.max(1, Math.floor(Math.sqrt((w * h) / 4000)));
+      const buckets = new Map();
+      for (let y = 0; y < h; y += step) {
+        for (let x = 0; x < w; x += step) {
+          const i = (y * w + x) * 4;
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+          let e = buckets.get(key);
+          if (!e) {
+            e = { c: 0, r: 0, g: 0, b: 0 };
+            buckets.set(key, e);
+          }
+          e.c++;
+          e.r += r;
+          e.g += g;
+          e.b += b;
+        }
+      }
+      let best = null;
+      buckets.forEach((e) => {
+        if (!best || e.c > best.c) best = e;
+      });
+      if (!best) return null;
+      const r = Math.round(best.r / best.c);
+      const g = Math.round(best.g / best.c);
+      const b = Math.round(best.b / best.c);
+      const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      return { bg: `rgb(${r},${g},${b})`, fg: lum > 0.55 ? '#111' : '#fff' };
+    } catch (e) {
+      return null;
     }
   }
 
@@ -303,7 +441,7 @@
         }
       });
     },
-    { rootMargin: '900px 0px' }
+    { rootMargin: `${LOOKAHEAD_PX}px 0px` }
   );
 
   function scanMangaImages() {
@@ -327,37 +465,86 @@
     });
   }
 
-  function renderBubbles(wrapper, data) {
-    (data.bubbles || []).forEach(({ box_2d, thai_text }) => {
-      if (!Array.isArray(box_2d) || box_2d.length !== 4) return;
-      const [ymin, xmin, ymax, xmax] = box_2d;
-      const box = document.createElement('div');
-      box.textContent = thai_text;
+  // ปรับขนาดตัวอักษรให้พอดีกรอบ ไม่ล้นไม่ถูกตัด
+  function fitFont(box, inner) {
+    const availH = box.clientHeight - 4;
+    const availW = box.clientWidth - 6;
+    if (!(availH > 0 && availW > 0)) return;
+    let lo = 7;
+    let hi = Math.max(lo, Math.min(availH * 0.85, availW * 0.6, 42));
+    for (let i = 0; i < 7; i++) {
+      const mid = (lo + hi) / 2;
+      inner.style.fontSize = `${mid}px`;
+      if (inner.offsetHeight <= availH && inner.scrollWidth <= availW) lo = mid;
+      else hi = mid;
+    }
+    inner.style.fontSize = `${lo}px`;
+  }
 
-      const widthPct = (xmax - xmin) / 10;
-      const heightPct = (ymax - ymin) / 10;
+  const renderedBoxes = [];
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => renderedBoxes.forEach((m) => fitFont(m.box, m.inner)), 250);
+  });
+
+  function renderBubbles(wrapper, data, img) {
+    const W = wrapper.clientWidth || img.clientWidth;
+    const H = wrapper.clientHeight || img.clientHeight;
+    const ratio = W && H ? W / H : 0.7;
+    const padX = 0.8; // ขยายกรอบออกเล็กน้อย (% ของความกว้างรูป) ให้ปิดตัวอักษรเดิมมิด
+    const padY = padX * ratio; // ระยะเท่ากันในแนวตั้ง
+
+    const made = [];
+    (data.bubbles || []).forEach((b) => {
+      const bx = b.box_2d;
+      if (!Array.isArray(bx) || bx.length !== 4 || !b.thai_text) return;
+      const nums = bx.map(Number);
+      if (nums.some(Number.isNaN)) return;
+      const ys = [nums[0], nums[2]].sort((a, c) => a - c);
+      const xs = [nums[1], nums[3]].sort((a, c) => a - c);
+      const left = Math.max(0, xs[0] / 10 - padX);
+      const top = Math.max(0, ys[0] / 10 - padY);
+      const right = Math.min(100, xs[1] / 10 + padX);
+      const bottom = Math.min(100, ys[1] / 10 + padY);
+      if (right <= left || bottom <= top) return;
+
+      const bg = b.bg || '#fff';
+      const fg = b.fg || '#111';
+      const wPx = ((right - left) / 100) * W;
+      const hPx = ((bottom - top) / 100) * H;
+
+      const box = document.createElement('div');
+      const inner = document.createElement('span');
+      inner.textContent = b.thai_text;
+      Object.assign(inner.style, { display: 'block', maxWidth: '100%' });
+      box.appendChild(inner);
 
       Object.assign(box.style, {
         position: 'absolute',
-        top: `${ymin / 10}%`,
-        left: `${xmin / 10}%`,
-        width: `${widthPct}%`,
-        height: `${heightPct}%`,
-        backgroundColor: 'rgba(255, 255, 255, 0.95)',
-        color: '#111',
-        borderRadius: '8px',
-        padding: '2px 4px',
+        top: `${top}%`,
+        left: `${left}%`,
+        width: `${right - left}%`,
+        height: `${bottom - top}%`,
+        backgroundColor: bg,
+        color: fg,
+        borderRadius: `${Math.round(Math.min(wPx, hPx) * 0.18)}px`,
+        boxShadow: `0 0 4px 3px ${bg}`, // ขอบเบลอกลืนเข้าหาภาพ
+        padding: '2px 3px',
         boxSizing: 'border-box',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         textAlign: 'center',
-        lineHeight: '1.2',
-        fontWeight: '600',
+        lineHeight: '1.25',
+        fontWeight: '700',
         fontFamily: '-apple-system, BlinkMacSystemFont, "Thonburi", sans-serif',
-        fontSize: `${Math.max(10, Math.min(16, Math.round(heightPct * 1.5)))}px`,
         overflow: 'hidden',
+        overflowWrap: 'anywhere',
+        textWrap: 'balance',
         zIndex: '9',
+        opacity: '0',
+        transition: 'opacity 0.25s ease',
       });
 
       // แตะที่กล่องเพื่อดูต้นฉบับชั่วคราว
@@ -367,6 +554,16 @@
       });
 
       wrapper.appendChild(box);
+      made.push({ box, inner });
+    });
+
+    // วัดและปรับฟอนต์หลังใส่ครบทุกกล่อง แล้วค่อยให้ค่อยๆ ปรากฏพร้อมกัน
+    made.forEach((m) => fitFont(m.box, m.inner));
+    made.forEach((m) => renderedBoxes.push(m));
+    requestAnimationFrame(() => {
+      made.forEach((m) => {
+        m.box.style.opacity = '1';
+      });
     });
   }
 
@@ -382,9 +579,17 @@
     const wrapper = document.createElement('div');
     wrapper.style.position = 'relative';
     wrapper.style.display = 'inline-block';
+    wrapper.style.verticalAlign = 'top';
     wrapper.style.width = img.style.width || '100%';
     img.parentNode.insertBefore(wrapper, img);
     wrapper.appendChild(img);
+
+    // เคยแปลรูปนี้แล้ว -> แสดงทันที ไม่ต้องเรียกเซิร์ฟเวอร์
+    const cached = cacheGet(src);
+    if (cached) {
+      renderBubbles(wrapper, cached, img);
+      return;
+    }
 
     const badge = document.createElement('div');
     Object.assign(badge.style, {
@@ -397,6 +602,7 @@
       padding: '4px 8px',
       borderRadius: '6px',
       fontSize: '12px',
+      lineHeight: '1.3',
       zIndex: '10',
     });
     wrapper.appendChild(badge);
@@ -406,13 +612,21 @@
       badge.style.background = 'rgba(0,0,0,0.75)';
       badge.onclick = null;
       try {
-        const payload = await buildPayload(src, prevSrc);
-        const data = await enqueue(() =>
-          callApiWithRetry(payload, (m) => {
+        const { data, sample } = await enqueue(async () => {
+          const built = await buildPayload(src, prevSrc);
+          const result = await callApiWithRetry(built.payload, (m) => {
             badge.innerText = m;
-          })
-        );
-        renderBubbles(wrapper, data);
+          });
+          return { data: result, sample: built.sample };
+        }, img);
+
+        const bubbles = (data.bubbles || []).map((b) => {
+          const c = sample ? sampleBox(sample, b.box_2d) : null;
+          return { box_2d: b.box_2d, thai_text: b.thai_text, bg: c && c.bg, fg: c && c.fg };
+        });
+        const slim = { bubbles };
+        cacheSet(src, slim);
+        renderBubbles(wrapper, slim, img);
         badge.remove();
       } catch (err) {
         const reason = String((err && err.message) || err).slice(0, 90);
