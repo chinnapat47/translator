@@ -4,6 +4,7 @@ import json
 import base64
 import asyncio
 import hashlib
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
@@ -43,6 +44,10 @@ MODEL_CANDIDATES = [
     if m
 ]
 working_model: Optional[str] = None
+# โมเดลที่โควต้าเต็มจะถูกพักไว้ชั่วคราว (ไม่ยิงซ้ำให้เสียเวลา): model -> (เวลาที่พักถึง, "daily"/"minute")
+model_cooldown: dict = {}
+DAILY_COOLDOWN_S = 1200   # โควต้ารายวัน: ลองใหม่ทุก ~20 นาที เผื่อรีเซ็ตแล้ว
+MINUTE_COOLDOWN_S = 45    # โควต้าต่อนาที
 # ไม่ให้เซิร์ฟเวอร์ล้มตั้งแต่ตอนเริ่มถ้าลืมตั้งค่า key (จะแจ้ง error ที่ชัดเจนตอนเรียกใช้แทน)
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
@@ -77,25 +82,13 @@ class TranslateRequest(BaseModel):
 class SpeechBubble(BaseModel):
     box_2d: list[float]     # [ymin, xmin, ymax, xmax] สเกล 0-1000
     speaker_desc: str       # เช่น "ชายผมดำ", "หญิงชุดนักเรียน", "กล่องบรรยาย"
-    speaker_name: Optional[str] = None      # ชื่อตัวละครที่พูด (ถ้ารู้) ใช้ผูกกับตารางสรรพนาม
-    addressee: Optional[str] = None         # พูดกับใคร (ชื่อ/คำอธิบาย) สรรพนามขึ้นกับคู่สนทนา
-    relationship: Optional[str] = None      # ความสัมพันธ์ เช่น "ศิษย์->อาจารย์", "เพื่อนสนิท", "ศัตรู"
     pronoun_style: str      # เช่น "ฉัน/นาย", "ข้า/เจ้า", "ผม/คุณ"
     thai_text: str          # คำแปลภาษาไทย
 
 
-class CharacterInfo(BaseModel):
-    name: str                       # ชื่อตัวละคร
-    gender: Optional[str] = None    # ชาย/หญิง/ไม่ระบุ
-    appearance: Optional[str] = None  # หน้าตาสั้นๆ ไว้จำตัวละครข้ามหน้า
-    self_pronoun: str               # คำที่ตัวละครใช้เรียกตัวเอง เช่น "ข้า", "ฉัน", "ผม", "หนู"
-    calls_others: list[str] = []    # เช่น "เรียกอาร์ธ: เจ้า", "เรียกอาจารย์: ท่าน"
-
-
 class PageTranslation(BaseModel):
     detected_genre: Optional[str] = None   # แนวเรื่อง เช่น "Murim", "Modern Action", "Fantasy"
-    new_glossary: list[str] = []           # ศัพท์เฉพาะใหม่ที่เจอในหน้านี้
-    characters: list[CharacterInfo] = []   # ตัวละครใหม่ หรือที่สรรพนามเปลี่ยนไปในหน้านี้
+    new_glossary: list[str] = []           # ตัวละคร/ศัพท์ใหม่ที่เจอในหน้านี้
     bubbles: list[SpeechBubble]
 
 
@@ -106,7 +99,7 @@ def get_memory_path(series_id: str) -> Path:
 
 
 def load_memory(series_id: str) -> dict:
-    default = {"genre": "Unknown", "glossary": [], "characters": {}, "recent_dialogues": []}
+    default = {"genre": "Unknown", "glossary": [], "recent_dialogues": []}
     path = get_memory_path(series_id)
     if path.exists():
         try:
@@ -193,22 +186,37 @@ async def get_image(http_client, url, b64, mime, referer, required):
     return None
 
 
+def short_name(model: str) -> str:
+    return model.replace("gemini-", "")
+
+
 async def call_gemini(contents):
     """เรียก Gemini แบบ async
-    - 404 (โมเดลใช้ไม่ได้) หรือ 429 (โควต้าเต็ม; โควต้านับแยกตามโมเดล) -> ข้ามไปโมเดลถัดไปทันที
-    - 500/503 (Gemini ไม่ว่าง) -> ลองซ้ำสั้นๆ แล้วค่อยข้ามไปโมเดลถัดไป
+    - 404 (โมเดลใช้ไม่ได้) -> ข้ามไปรุ่นถัดไป
+    - 429 (โควต้าเต็ม; นับแยกตามโมเดล) -> พักรุ่นนั้นไว้แล้วข้ามไปรุ่นถัดไป
+    - 500/503 (Gemini ไม่ว่าง) -> ลองซ้ำครั้งเดียวแล้วข้ามไปรุ่นถัดไป
     """
     global working_model
-    candidates = ([working_model] if working_model else []) + [
+    now = time.monotonic()
+    ordered = ([working_model] if working_model else []) + [
         m for m in MODEL_CANDIDATES if m != working_model
     ]
-    delays = [1.5]  # Gemini ไม่ว่าง: ลองซ้ำครั้งเดียวแล้วข้ามไปรุ่นถัดไป ไม่รอนาน
-    last_msg = ""
-    quota_hit = False
-    quota_all_daily = True
-    overloaded = False
+    ready = [m for m in ordered if model_cooldown.get(m, (0, ""))[0] <= now]
 
-    for model in candidates:
+    if not ready:
+        # ทุกรุ่นกำลังพักเพราะโควต้าเต็ม -> ตอบทันที ไม่ต้องยิง Gemini ซ้ำ
+        soonest = min(model_cooldown[m][0] for m in ordered)
+        kinds = {model_cooldown[m][1] for m in ordered}
+        kind = "รายวัน" if kinds == {"daily"} else "ต่อนาที"
+        mins = max(1, int((soonest - now) // 60) + 1)
+        raise HTTPException(status_code=429, detail=f"โควต้า Gemini {kind}เต็มทุกรุ่น ลองใหม่อีกประมาณ {mins} นาที")
+
+    delays = [1.5]
+    quota_models = []   # [(model, daily?)]
+    overloaded_models = []
+    last_msg = ""
+
+    for model in ready:
         use_thinking = True
         for attempt in range(len(delays) + 1):
             try:
@@ -230,7 +238,7 @@ async def call_gemini(contents):
             except genai_errors.APIError as e:
                 code = getattr(e, "code", None)
                 raw = str(e)
-                last_msg = f"{model}: {code} {getattr(e, 'message', raw)}"
+                last_msg = f"{short_name(model)}: {code} {getattr(e, 'message', raw)}"
                 if code == 400 and use_thinking and "thinking" in raw.lower():
                     use_thinking = False  # รุ่นนี้ไม่รับ thinking_level -> ลองใหม่แบบไม่ตั้ง
                     continue
@@ -239,34 +247,52 @@ async def call_gemini(contents):
                         working_model = None
                     break
                 if code == 429:
-                    quota_hit = True
-                    if "perday" not in raw.lower().replace(" ", "").replace("_", ""):
-                        quota_all_daily = False
+                    daily = "perday" in raw.lower().replace(" ", "").replace("_", "")
+                    cool = DAILY_COOLDOWN_S if daily else MINUTE_COOLDOWN_S
+                    model_cooldown[model] = (time.monotonic() + cool, "daily" if daily else "minute")
+                    quota_models.append((model, daily))
                     break
                 if code in (500, 503):
-                    overloaded = True
                     if attempt < len(delays):
                         await asyncio.sleep(delays[attempt])
                         continue
+                    overloaded_models.append(model)
                     break
                 # error อื่น (400/403 ฯลฯ) ลองซ้ำไม่ช่วย ส่ง 500 เพื่อไม่ให้ฝั่งเบราว์เซอร์ retry
                 raise HTTPException(status_code=500, detail=f"Gemini error {last_msg}"[:300])
 
-    if quota_hit:
-        kind = "รายวัน" if quota_all_daily else "ต่อนาที"
-        raise HTTPException(status_code=429, detail=f"Gemini โควต้าเต็ม ({kind}) {last_msg}"[:300])
-    if overloaded:
-        raise HTTPException(status_code=503, detail=f"Gemini ไม่ว่างชั่วคราว {last_msg}"[:300])
+    def names(ms):
+        return ", ".join(short_name(m) for m in ms)
+
+    quota_txt = ""
+    if quota_models:
+        kind = "รายวัน" if all(d for _, d in quota_models) else "ต่อนาที"
+        quota_txt = f"โควต้า{kind}เต็ม ({names([m for m, _ in quota_models])})"
+
+    if overloaded_models:
+        # ไม่ว่างชั่วคราว -> 503 เพื่อให้ฝั่งมือถือรอแล้วลองใหม่ (ต่างจากโควต้ารายวันที่รอไปก็ไม่หาย)
+        parts = [quota_txt, f"{names(overloaded_models)} ไม่ว่างชั่วคราว"]
+        raise HTTPException(status_code=503, detail=" / ".join(x for x in parts if x)[:300])
+    if quota_models:
+        raise HTTPException(status_code=429, detail=quota_txt[:300])
     raise HTTPException(
         status_code=500,
-        detail=f"ไม่มีโมเดล Gemini ที่ใช้ได้ (ลอง {', '.join(candidates)}) ล่าสุด: {last_msg}"[:300],
+        detail=f"ไม่มีโมเดล Gemini ที่ใช้ได้ (ลอง {names(ready)}) ล่าสุด: {last_msg}"[:300],
     )
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health():
     # ใช้ปลุกเซิร์ฟเวอร์ Render ที่หลับอยู่ + เช็กว่าตั้งค่า key แล้วหรือยัง
-    return {"status": "ok", "gemini_key_set": client is not None, "model": working_model, "candidates": MODEL_CANDIDATES}
+    now = time.monotonic()
+    cooling = {short_name(m): f"{kind} {int(until - now)}s" for m, (until, kind) in model_cooldown.items() if until > now}
+    return {
+        "status": "ok",
+        "gemini_key_set": client is not None,
+        "model": working_model,
+        "candidates": MODEL_CANDIDATES,
+        "cooling_down": cooling,
+    }
 
 
 # รับ POST / ด้วย เผื่อ API_URL ใน userscript ลืมใส่ /translate ต่อท้าย
@@ -301,16 +327,6 @@ async def translate_manhwa_page(req: TranslateRequest):
     mem = load_memory(req.series_id)
     glossary_text = "\n".join(f"- {item}" for item in mem["glossary"][-40:]) or "ยังไม่มีข้อมูล"
     recent_text = "\n".join(mem["recent_dialogues"][-15:]) or "ยังไม่มีบทสนทนาก่อนหน้า"
-    char_lines = []
-    for c in list(mem["characters"].values())[-30:]:
-        line = f"- {c.get('name')} ({c.get('gender') or '?'}"
-        if c.get("appearance"):
-            line += f", {c['appearance']}"
-        line += f"): เรียกตัวเองว่า \"{c.get('self_pronoun')}\""
-        if c.get("calls_others"):
-            line += "; " + "; ".join(c["calls_others"])
-        char_lines.append(line)
-    characters_text = "\n".join(char_lines) or "ยังไม่มีข้อมูล"
 
     # 3. สร้าง Prompt พร้อมบริบท
     prompt = f"""
@@ -321,27 +337,19 @@ async def translate_manhwa_page(req: TranslateRequest):
 - ตัวละครและศัพท์เฉพาะที่รู้แล้ว:
 {glossary_text}
 
-[ตารางสรรพนามตัวละคร (ยึดตามนี้เสมอเพื่อให้ต่อเนื่องทั้งเรื่อง)]
-{characters_text}
-
 [บทสนทนาล่าสุดจากหน้าก่อนหน้า]
 {recent_text}
 
 [คำสั่ง]
 1. แปลเฉพาะข้อความที่อยู่ใน "ภาพหลัก (ภาพสุดท้าย)" เท่านั้น หากมีภาพก่อนหน้าแนบมา ให้ใช้ดูหน้าตาตัวละครและบริบทต่อเนื่องเท่านั้น ห้ามดึงพิกัดจากภาพก่อนหน้า
-2. ดูหางกรอบคำพูดและหน้าตาตัวละครเพื่อระบุว่าใครพูดกับใคร ใส่ใน `speaker_desc`, `speaker_name`, `addressee`, `relationship` แล้วเลือกสรรพนามใน `pronoun_style` โดยพิจารณาตามลำดับนี้:
-   ก. ถ้าตัวละครอยู่ในตารางสรรพนามแล้ว ให้ใช้ตามตารางเสมอ ยกเว้นอารมณ์/สถานการณ์เปลี่ยนชัดเจน (เช่น โกรธจัดเปลี่ยนเป็น กู/มึง) หรือเปลี่ยนคู่สนทนา
-   ข. ความสัมพันธ์ของผู้พูดกับผู้ฟัง: อาวุโส/ตำแหน่ง (ศิษย์-อาจารย์, ลูกน้อง-เจ้านาย), ความสนิท (เพื่อนสนิท/คนแปลกหน้า), ท่าทีเป็นมิตรหรือศัตรู
-   ค. ยุคและแนวเรื่อง (Murim/แฟนตาซีโบราณ ใช้ ข้า/เจ้า/ท่าน, ราชสำนักใช้ คำราชาศัพท์ตามฐานะ, แนวปัจจุบันใช้ ฉัน/ผม/คุณ/นาย)
-   ง. เพศ อายุ และบุคลิก (เด็ก/คนน่ารักอาจใช้ หนู/เรา, คนหยิ่งหรือเย็นชาใช้ ข้า/ฉัน แบบห้วนๆ)
-   จ. ระดับความเป็นทางการของฉาก
-   - สรรพนามเดียวกันของตัวละครหนึ่งตัวต้องไม่เปลี่ยนมั่วระหว่างหน้า
+2. ดูหางกรอบคำพูดและหน้าตาตัวละครเพื่อระบุเพศ/อารมณ์ใน `speaker_desc` และเลือกสรรพนามใน `pronoun_style` ให้เข้ากับแนวเรื่อง (เช่น แนว Murim/แฟนตาซี ใช้ ข้า/เจ้า, แนวปัจจุบันใช้ ฉัน/นาย หรือ กู/มึง ตามความสนิท)
 3. แปลเป็นไทยให้ได้อารมณ์การ์ตูน กระชับ อ่านลื่นตา ไม่แปลตรงตัวทื่อๆ
 4. ข้ามเสียงเอฟเฟกต์ (SFX) ขนาดใหญ่ที่เป็นส่วนหนึ่งของฉาก
-5. หากเจอตัวละครใหม่ที่ยังไม่มีในตารางสรรพนาม ให้เพิ่มใน `characters` (ชื่อ, เพศ, หน้าตาสั้นๆ, คำเรียกตัวเอง, คำเรียกคนอื่น) และใส่ศัพท์เฉพาะสำคัญที่ยังไม่มีในลิสต์ลง `new_glossary` ถ้าไม่รู้ชื่อให้ตั้งชื่อชั่วคราวจากลักษณะเด่น เช่น "ชายผมขาว"
+5. หากเจอชื่อตัวละครใหม่หรือศัพท์เฉพาะสำคัญที่ยังไม่มีในลิสต์ ให้เพิ่มใน `new_glossary` ในรูปแบบ "ชื่อ (เพศ, บทบาท/สรรพนาม)"
 6. ระบุพิกัดกรอบคำพูดใน `box_2d` แบบ [ymin, xmin, ymax, xmax] (สเกล 0-1000)
 7. ให้ `box_2d` ครอบข้อความต้นฉบับทั้งหมดในกรอบคำพูดนั้นให้มิดทุกตัวอักษร แต่อย่าลามไปทับภาพวาดนอกกรอบ เพราะคำแปลจะถูกวางทับตรงกรอบนี้
 8. คำแปลต้องกระชับพอใส่ลงในกรอบเดิมได้ ตัดคำฟุ่มเฟือย และไม่ต้องขึ้นบรรทัดใหม่เอง
+9. ถ้าข้อความในกรอบคำพูดเดียวกันเป็นประโยคเดียวกันแต่ถูกแบ่งเป็นหลายบรรทัดหรือหลายส่วน (เช่น คำท้ายประโยคที่ตัวอักษรจางหรือเล็กกว่า) ให้รวมเป็นรายการเดียว แปลเป็นประโยคต่อเนื่อง และให้ `box_2d` ครอบทุกบรรทัดนั้น ห้ามแยกเป็นหลายรายการ
 """
 
     contents = []
@@ -377,25 +385,8 @@ async def translate_manhwa_page(req: TranslateRequest):
                 if entry not in mem["glossary"]:
                     mem["glossary"].append(entry)
 
-            for ch in result.characters:
-                key = ch.name.strip()
-                if not key:
-                    continue
-                old_ch = mem["characters"].get(key)
-                if old_ch:
-                    # ตัวละครเดิม: คงสรรพนามเดิมไว้ แต่เพิ่มคำเรียกคนอื่นที่เจอใหม่
-                    merged = list(dict.fromkeys(old_ch.get("calls_others", []) + ch.calls_others))
-                    old_ch["calls_others"] = merged[-8:]
-                else:
-                    mem["characters"][key] = ch.model_dump()
-            # จำกัดจำนวนตัวละครที่เก็บ (ตัวเก่าสุดหลุดก่อน)
-            while len(mem["characters"]) > 60:
-                mem["characters"].pop(next(iter(mem["characters"])))
-
             for b in result.bubbles:
-                who = b.speaker_name or b.speaker_desc
-                to = f" -> {b.addressee}" if b.addressee else ""
-                mem["recent_dialogues"].append(f"[{who}{to} | {b.pronoun_style}]: {b.thai_text}")
+                mem["recent_dialogues"].append(f"[{b.speaker_desc}]: {b.thai_text}")
             mem["recent_dialogues"] = mem["recent_dialogues"][-20:]  # เก็บแค่ 20 บรรทัดล่าสุด
 
             save_memory(req.series_id, mem)
