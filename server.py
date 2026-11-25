@@ -77,13 +77,25 @@ class TranslateRequest(BaseModel):
 class SpeechBubble(BaseModel):
     box_2d: list[float]     # [ymin, xmin, ymax, xmax] สเกล 0-1000
     speaker_desc: str       # เช่น "ชายผมดำ", "หญิงชุดนักเรียน", "กล่องบรรยาย"
+    speaker_name: Optional[str] = None      # ชื่อตัวละครที่พูด (ถ้ารู้) ใช้ผูกกับตารางสรรพนาม
+    addressee: Optional[str] = None         # พูดกับใคร (ชื่อ/คำอธิบาย) สรรพนามขึ้นกับคู่สนทนา
+    relationship: Optional[str] = None      # ความสัมพันธ์ เช่น "ศิษย์->อาจารย์", "เพื่อนสนิท", "ศัตรู"
     pronoun_style: str      # เช่น "ฉัน/นาย", "ข้า/เจ้า", "ผม/คุณ"
     thai_text: str          # คำแปลภาษาไทย
 
 
+class CharacterInfo(BaseModel):
+    name: str                       # ชื่อตัวละคร
+    gender: Optional[str] = None    # ชาย/หญิง/ไม่ระบุ
+    appearance: Optional[str] = None  # หน้าตาสั้นๆ ไว้จำตัวละครข้ามหน้า
+    self_pronoun: str               # คำที่ตัวละครใช้เรียกตัวเอง เช่น "ข้า", "ฉัน", "ผม", "หนู"
+    calls_others: list[str] = []    # เช่น "เรียกอาร์ธ: เจ้า", "เรียกอาจารย์: ท่าน"
+
+
 class PageTranslation(BaseModel):
     detected_genre: Optional[str] = None   # แนวเรื่อง เช่น "Murim", "Modern Action", "Fantasy"
-    new_glossary: list[str] = []           # ตัวละคร/ศัพท์ใหม่ที่เจอในหน้านี้
+    new_glossary: list[str] = []           # ศัพท์เฉพาะใหม่ที่เจอในหน้านี้
+    characters: list[CharacterInfo] = []   # ตัวละครใหม่ หรือที่สรรพนามเปลี่ยนไปในหน้านี้
     bubbles: list[SpeechBubble]
 
 
@@ -94,7 +106,7 @@ def get_memory_path(series_id: str) -> Path:
 
 
 def load_memory(series_id: str) -> dict:
-    default = {"genre": "Unknown", "glossary": [], "recent_dialogues": []}
+    default = {"genre": "Unknown", "glossary": [], "characters": {}, "recent_dialogues": []}
     path = get_memory_path(series_id)
     if path.exists():
         try:
@@ -289,6 +301,16 @@ async def translate_manhwa_page(req: TranslateRequest):
     mem = load_memory(req.series_id)
     glossary_text = "\n".join(f"- {item}" for item in mem["glossary"][-40:]) or "ยังไม่มีข้อมูล"
     recent_text = "\n".join(mem["recent_dialogues"][-15:]) or "ยังไม่มีบทสนทนาก่อนหน้า"
+    char_lines = []
+    for c in list(mem["characters"].values())[-30:]:
+        line = f"- {c.get('name')} ({c.get('gender') or '?'}"
+        if c.get("appearance"):
+            line += f", {c['appearance']}"
+        line += f"): เรียกตัวเองว่า \"{c.get('self_pronoun')}\""
+        if c.get("calls_others"):
+            line += "; " + "; ".join(c["calls_others"])
+        char_lines.append(line)
+    characters_text = "\n".join(char_lines) or "ยังไม่มีข้อมูล"
 
     # 3. สร้าง Prompt พร้อมบริบท
     prompt = f"""
@@ -299,15 +321,24 @@ async def translate_manhwa_page(req: TranslateRequest):
 - ตัวละครและศัพท์เฉพาะที่รู้แล้ว:
 {glossary_text}
 
+[ตารางสรรพนามตัวละคร (ยึดตามนี้เสมอเพื่อให้ต่อเนื่องทั้งเรื่อง)]
+{characters_text}
+
 [บทสนทนาล่าสุดจากหน้าก่อนหน้า]
 {recent_text}
 
 [คำสั่ง]
 1. แปลเฉพาะข้อความที่อยู่ใน "ภาพหลัก (ภาพสุดท้าย)" เท่านั้น หากมีภาพก่อนหน้าแนบมา ให้ใช้ดูหน้าตาตัวละครและบริบทต่อเนื่องเท่านั้น ห้ามดึงพิกัดจากภาพก่อนหน้า
-2. ดูหางกรอบคำพูดและหน้าตาตัวละครเพื่อระบุเพศ/อารมณ์ใน `speaker_desc` และเลือกสรรพนามใน `pronoun_style` ให้เข้ากับแนวเรื่อง (เช่น แนว Murim/แฟนตาซี ใช้ ข้า/เจ้า, แนวปัจจุบันใช้ ฉัน/นาย หรือ กู/มึง ตามความสนิท)
+2. ดูหางกรอบคำพูดและหน้าตาตัวละครเพื่อระบุว่าใครพูดกับใคร ใส่ใน `speaker_desc`, `speaker_name`, `addressee`, `relationship` แล้วเลือกสรรพนามใน `pronoun_style` โดยพิจารณาตามลำดับนี้:
+   ก. ถ้าตัวละครอยู่ในตารางสรรพนามแล้ว ให้ใช้ตามตารางเสมอ ยกเว้นอารมณ์/สถานการณ์เปลี่ยนชัดเจน (เช่น โกรธจัดเปลี่ยนเป็น กู/มึง) หรือเปลี่ยนคู่สนทนา
+   ข. ความสัมพันธ์ของผู้พูดกับผู้ฟัง: อาวุโส/ตำแหน่ง (ศิษย์-อาจารย์, ลูกน้อง-เจ้านาย), ความสนิท (เพื่อนสนิท/คนแปลกหน้า), ท่าทีเป็นมิตรหรือศัตรู
+   ค. ยุคและแนวเรื่อง (Murim/แฟนตาซีโบราณ ใช้ ข้า/เจ้า/ท่าน, ราชสำนักใช้ คำราชาศัพท์ตามฐานะ, แนวปัจจุบันใช้ ฉัน/ผม/คุณ/นาย)
+   ง. เพศ อายุ และบุคลิก (เด็ก/คนน่ารักอาจใช้ หนู/เรา, คนหยิ่งหรือเย็นชาใช้ ข้า/ฉัน แบบห้วนๆ)
+   จ. ระดับความเป็นทางการของฉาก
+   - สรรพนามเดียวกันของตัวละครหนึ่งตัวต้องไม่เปลี่ยนมั่วระหว่างหน้า
 3. แปลเป็นไทยให้ได้อารมณ์การ์ตูน กระชับ อ่านลื่นตา ไม่แปลตรงตัวทื่อๆ
 4. ข้ามเสียงเอฟเฟกต์ (SFX) ขนาดใหญ่ที่เป็นส่วนหนึ่งของฉาก
-5. หากเจอชื่อตัวละครใหม่หรือศัพท์เฉพาะสำคัญที่ยังไม่มีในลิสต์ ให้เพิ่มใน `new_glossary` ในรูปแบบ "ชื่อ (เพศ, บทบาท/สรรพนาม)"
+5. หากเจอตัวละครใหม่ที่ยังไม่มีในตารางสรรพนาม ให้เพิ่มใน `characters` (ชื่อ, เพศ, หน้าตาสั้นๆ, คำเรียกตัวเอง, คำเรียกคนอื่น) และใส่ศัพท์เฉพาะสำคัญที่ยังไม่มีในลิสต์ลง `new_glossary` ถ้าไม่รู้ชื่อให้ตั้งชื่อชั่วคราวจากลักษณะเด่น เช่น "ชายผมขาว"
 6. ระบุพิกัดกรอบคำพูดใน `box_2d` แบบ [ymin, xmin, ymax, xmax] (สเกล 0-1000)
 7. ให้ `box_2d` ครอบข้อความต้นฉบับทั้งหมดในกรอบคำพูดนั้นให้มิดทุกตัวอักษร แต่อย่าลามไปทับภาพวาดนอกกรอบ เพราะคำแปลจะถูกวางทับตรงกรอบนี้
 8. คำแปลต้องกระชับพอใส่ลงในกรอบเดิมได้ ตัดคำฟุ่มเฟือย และไม่ต้องขึ้นบรรทัดใหม่เอง
@@ -346,8 +377,25 @@ async def translate_manhwa_page(req: TranslateRequest):
                 if entry not in mem["glossary"]:
                     mem["glossary"].append(entry)
 
+            for ch in result.characters:
+                key = ch.name.strip()
+                if not key:
+                    continue
+                old_ch = mem["characters"].get(key)
+                if old_ch:
+                    # ตัวละครเดิม: คงสรรพนามเดิมไว้ แต่เพิ่มคำเรียกคนอื่นที่เจอใหม่
+                    merged = list(dict.fromkeys(old_ch.get("calls_others", []) + ch.calls_others))
+                    old_ch["calls_others"] = merged[-8:]
+                else:
+                    mem["characters"][key] = ch.model_dump()
+            # จำกัดจำนวนตัวละครที่เก็บ (ตัวเก่าสุดหลุดก่อน)
+            while len(mem["characters"]) > 60:
+                mem["characters"].pop(next(iter(mem["characters"])))
+
             for b in result.bubbles:
-                mem["recent_dialogues"].append(f"[{b.speaker_desc}]: {b.thai_text}")
+                who = b.speaker_name or b.speaker_desc
+                to = f" -> {b.addressee}" if b.addressee else ""
+                mem["recent_dialogues"].append(f"[{who}{to} | {b.pronoun_style}]: {b.thai_text}")
             mem["recent_dialogues"] = mem["recent_dialogues"][-20:]  # เก็บแค่ 20 บรรทัดล่าสุด
 
             save_memory(req.series_id, mem)
