@@ -12,7 +12,7 @@
   'use strict';
 
   // เปลี่ยนเป็นลิงก์จาก Render ของคุณ (ต้องมี /translate ต่อท้าย)
-  const API_URL = 'https://translator-o53c.onrender.com/';
+const API_URL = 'https://translator-o53c.onrender.com/translate';
 
   let isEnabled = false;
   const processedImages = new WeakSet();
